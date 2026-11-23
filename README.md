@@ -2,7 +2,7 @@
 
 Tells you when something happens on the radio: a fire page goes out, a siren is set off, a radio
 sends an emergency alarm, a talkgroup is heard for the first time. Rules say what to watch for;
-destinations say where word goes: Discord, Slack, ntfy, any webhook, or a command on the
+destinations say where word goes: Discord, Slack (webhook or app), ntfy, any webhook, or a command on the
 recorder's computer. A call's recording can follow.
 
 ## Features
@@ -16,7 +16,7 @@ recorder's computer. A call's recording can follow.
   or a body template of your own; headers for tokens
 - Commands, given the notification on stdin and as `TRP_*` variables
 - **Sent when it's heard, when the call ends, or both**, and **with the recording** when the call
-  ends: a file for Discord and ntfy, inline for JSON webhooks, a file's path for commands, a link
+  ends: a file for Discord, ntfy and Slack apps, inline for JSON webhooks, a file's path for commands, a link
   where a file can't go
 - **Send a test** and **Send a test recording** on each destination
 - Its own page in the recorder's interface, and a **Notify** button on each signal
@@ -104,12 +104,14 @@ plugin's data folder.
 | Setting | Key | Description |
 | ------- | --- | ----------- |
 | Name | `name` | What rules send to it by |
-| Kind | `type` | `webhook` or `command` |
+| Kind | `type` | `webhook`, `slack` (a Slack app) or `command` |
 | Format | `format` | Webhooks: `json` (the notification), `discord`, `slack` or `ntfy` |
 | URL | `url` | Webhooks: where to |
 | Method | `method` | Webhooks: empty for POST |
 | Headers | `headers` | Webhooks: one a line, `Authorization: Bearer abc` |
 | Own body | `body` | Webhooks: a template in place of the format: `{title}` `{text}` `{rule}` `{event}` `{system}` `{talkgroup}` `{alpha_tag}` `{unit}` `{signals}` `{url}` `{json}`. One that begins `{` is sent as JSON, its values escaped |
+| Bot token | `token` | Slack apps: the app's bot token (`xoxb-…`), with the `chat:write` scope, and `files:write` to send recordings |
+| Channel | `channel` | Slack apps: the channel's ID (`C0123456789`). The app must be in the channel (`/invite @app`). A name works for messages, but files need the ID |
 | Command | `command` | Run by the shell, with the notification's JSON on stdin and `TRP_TITLE`, `TRP_TEXT`, `TRP_RULE`, `TRP_EVENT`, `TRP_SYSTEM`, `TRP_TALKGROUP`, `TRP_UNIT`, `TRP_SIGNALS`, `TRP_URL` and, for a recording, `TRP_AUDIO`. It has 30 seconds |
 
 ### When the call ends
@@ -129,16 +131,17 @@ A rule **with the recording** sends its call-end message with the call's audio (
 | Discord | Attached to the message |
 | ntfy | The notification's attachment |
 | JSON webhook | Inline: `audio` with its `name`, `type` and `base64` |
-| Slack | A link only: Slack's incoming webhooks can't take a file |
+| Slack app (`slack`) | Uploaded to the channel as a file, the message as its comment |
+| Slack webhook | A link only: Slack's incoming webhooks can't take a file |
 | Own body | A link only (`{url}`) |
 | Command | A file of its own, `TRP_AUDIO`, there while the command runs |
 
 **Link recordings from** gives every recording notification a link to the call as well, and is the
-only way Slack gets one: set it to the recorder's address as the people reading the notifications
+only way a Slack webhook gets one: set it to the recorder's address as the people reading the notifications
 reach it, such as its Tailscale address. The link plays the call for as long as the recorder keeps
 its audio (Setup → Recording). Empty: no links.
 
-A webhook that can't be reached, or answers with a server error, is tried twice more (after 2 and
+A webhook or Slack app that can't be reached, or answers with a server error, is tried twice more (after 2 and
 10 seconds). Email and many other services are reachable through an
 [Apprise API](https://github.com/caronc/apprise-api) URL.
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+- A **Slack app** destination (`type: "slack"`, with a bot `token` and `channel`): messages go to the
+  channel as blocks, and a recording is uploaded as a file with the message as its comment, which
+  Slack's incoming webhooks can't do. Slack webhooks are unchanged.
+
 ## [0.2.2]
 
 - Rules take exclude lists: **Not these talkgroups** (`excludeTalkgroups`) and **Not these radios**

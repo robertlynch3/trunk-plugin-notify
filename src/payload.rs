@@ -249,12 +249,29 @@ fn discord(n: &Notification) -> Value {
     json!({ "username": "Trunk Recorder Pro", "embeds": [embed] })
 }
 
-fn slack(n: &Notification) -> Value {
+/// A Slack message's words: the headline and text (with the recording's link), and the fields' line.
+fn slack_parts(n: &Notification) -> (String, String) {
     let context = fields(n).into_iter().map(|(k, v)| format!("*{k}:* {v}")).collect::<Vec<_>>().join("   ");
     let mut text = format!("*{}*\n{}", n.title, n.text);
     if !n.url.is_empty() {
         text.push_str(&format!("\n<{}|Play the recording>", n.url));
     }
+    (text, context)
+}
+
+/// A file's comment in Slack: the message's words in one piece (a file's comment takes no blocks).
+pub fn slack_comment(n: &Notification) -> String {
+    let (text, context) = slack_parts(n);
+    if context.is_empty() {
+        text
+    } else {
+        format!("{text}\n{context}")
+    }
+}
+
+/// A Slack message's blocks, with `text` for notifications that can't show them.
+pub fn slack(n: &Notification) -> Value {
+    let (text, context) = slack_parts(n);
     let mut blocks = vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": text } })];
     if !context.is_empty() {
         blocks.push(json!({ "type": "context", "elements": [{ "type": "mrkdwn", "text": context }] }));

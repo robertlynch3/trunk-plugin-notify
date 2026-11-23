@@ -16,6 +16,9 @@ use crate::payload::{self, audio_type, command_env, payload, Notification};
 use crate::settings::{Destination, Kind};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// A recording takes longer to send than a message.
+const FILE_TIMEOUT: Duration = Duration::from_secs(30);
+const SLACK_API: &str = "https://slack.com/api";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// A webhook that failed is tried again after these.
 const RETRIES: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(10)];
@@ -107,6 +110,7 @@ fn metrics(all: &BTreeMap<String, Health>) -> Metrics {
 pub fn send(dest: &Destination, n: &Notification, audio: Option<&(Vec<u8>, String)>) -> Result<(), String> {
     match dest.kind {
         Kind::Webhook => webhook(dest, n, audio),
+        Kind::Slack => slack_app(SLACK_API, dest, n, audio),
         Kind::Command => command(dest, n, audio),
     }
 }
@@ -130,12 +134,7 @@ fn webhook(dest: &Destination, n: &Notification, audio: Option<&(Vec<u8>, String
     if !(dest.url.starts_with("http://") || dest.url.starts_with("https://")) {
         return Err("its URL must begin http:// or https://".into());
     }
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(TIMEOUT))
-        .http_status_as_error(false)
-        .user_agent(concat!("trunk-plugin-notify/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into();
+    let agent = agent(if audio.is_some() { FILE_TIMEOUT } else { TIMEOUT });
     let p = payload(dest, n, audio);
     let (content_type, body) = match audio.filter(|_| p.multipart) {
         Some(file) => multipart(&p.body, file),
@@ -144,9 +143,7 @@ fn webhook(dest: &Destination, n: &Notification, audio: Option<&(Vec<u8>, String
     let url = with_query(&dest.url, &p.query);
     let method = if dest.method.trim().is_empty() { "POST".to_string() } else { dest.method.trim().to_ascii_uppercase() };
     let own = dest.header_list();
-    let mut last = String::new();
-    for wait in std::iter::once(Duration::ZERO).chain(RETRIES) {
-        std::thread::sleep(wait);
+    retrying(|| {
         let mut req = ureq::http::Request::builder().method(method.as_str()).uri(&url);
         if !own.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
             req = req.header("Content-Type", content_type.as_str());
@@ -154,24 +151,131 @@ fn webhook(dest: &Destination, n: &Notification, audio: Option<&(Vec<u8>, String
         for (k, v) in &own {
             req = req.header(k.as_str(), v.as_str());
         }
-        let req = req.body(body.clone()).map_err(|e| format!("couldn't make the request: {e}"))?;
+        let req = req.body(body.clone()).map_err(|e| Fail::Final(format!("couldn't make the request: {e}")))?;
         match agent.run(req) {
-            Ok(r) if r.status().is_success() => return Ok(()),
+            Ok(r) if r.status().is_success() => Ok(()),
             // (A client error won't go better for trying again.)
-            Ok(r) if r.status().is_client_error() => return Err(format!("it answered {}", r.status())),
-            Ok(r) => last = format!("it answered {}", r.status()),
-            Err(e) => last = format!("couldn't reach it: {e}"),
+            Ok(r) if r.status().is_client_error() => Err(Fail::Final(format!("it answered {}", r.status()))),
+            Ok(r) => Err(Fail::Retry(format!("it answered {}", r.status()))),
+            Err(e) => Err(Fail::Retry(format!("couldn't reach it: {e}"))),
+        }
+    })
+}
+
+/// How an attempt at sending failed: for good, or maybe not next time.
+enum Fail {
+    Final(String),
+    Retry(String),
+}
+
+/// `attempt` now, and after each of `RETRIES` while it fails in a way that might pass.
+fn retrying(mut attempt: impl FnMut() -> Result<(), Fail>) -> Result<(), String> {
+    let mut last = String::new();
+    for wait in std::iter::once(Duration::ZERO).chain(RETRIES) {
+        std::thread::sleep(wait);
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(Fail::Final(e)) => return Err(e),
+            Err(Fail::Retry(e)) => last = e,
         }
     }
     Err(last)
 }
 
+fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .user_agent(concat!("trunk-plugin-notify/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into()
+}
+
+/// Percent-encoded, as a query's or a form's value.
+fn pct(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+/// A POST to Slack's (or anything speaking its) Web API: `body` as a form or JSON, the answer's JSON.
+fn slack_post(agent: &ureq::Agent, url: &str, token: Option<&str>, content_type: &str, body: Vec<u8>) -> Result<serde_json::Value, Fail> {
+    let mut req = ureq::http::Request::builder().method("POST").uri(url).header("Content-Type", content_type);
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    let req = req.body(body).map_err(|e| Fail::Final(format!("couldn't make the request: {e}")))?;
+    let mut r = agent.run(req).map_err(|e| Fail::Retry(format!("couldn't reach Slack: {e}")))?;
+    let status = r.status();
+    if status.as_u16() == 429 || status.is_server_error() {
+        return Err(Fail::Retry(format!("Slack answered {status}")));
+    }
+    let text = r.body_mut().read_to_string().unwrap_or_default();
+    if !status.is_success() {
+        return Err(Fail::Final(format!("Slack answered {status}")));
+    }
+    // (Slack answers 200 with "ok": false and an "error" when it won't.)
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    if v["ok"].as_bool() == Some(true) {
+        return Ok(v);
+    }
+    let error = v["error"].as_str().unwrap_or("no reason given");
+    let why = match v["needed"].as_str() {
+        Some(scope) => format!("Slack said {error} (the app needs the {scope} scope)"),
+        None => format!("Slack said {error}"),
+    };
+    Err(if matches!(error, "ratelimited" | "internal_error" | "service_unavailable" | "fatal_error" | "request_timeout") {
+        Fail::Retry(why)
+    } else {
+        Fail::Final(why)
+    })
+}
+
+/// A Slack app's message to its channel: with a recording, as a file (Slack's three steps: ask where
+/// to put it, put it there, post it with the words as its comment); without, the message's blocks.
+fn slack_app(api: &str, dest: &Destination, n: &Notification, audio: Option<&payload::Audio>) -> Result<(), String> {
+    let (token, channel) = (dest.token.trim(), dest.channel.trim().trim_start_matches('#'));
+    if token.is_empty() || channel.is_empty() {
+        return Err("it needs a bot token and a channel".into());
+    }
+    let agent = agent(FILE_TIMEOUT);
+    let json = "application/json; charset=utf-8";
+    let file = audio.filter(|_| n.event == "recording");
+    retrying(|| {
+        let Some((bytes, name)) = file else {
+            let mut m = payload::slack(n);
+            m["channel"] = channel.into();
+            return slack_post(&agent, &format!("{api}/chat.postMessage"), Some(token), json, m.to_string().into_bytes()).map(drop);
+        };
+        let form = format!("filename={}&length={}", pct(name), bytes.len());
+        let slot = slack_post(&agent, &format!("{api}/files.getUploadURLExternal"), Some(token), "application/x-www-form-urlencoded", form.into_bytes())?;
+        let (Some(url), Some(id)) = (slot["upload_url"].as_str(), slot["file_id"].as_str()) else {
+            return Err(Fail::Final("Slack gave nowhere to put the file".into()));
+        };
+        let put = agent
+            .run(
+                ureq::http::Request::builder()
+                    .method("POST")
+                    .uri(url)
+                    .header("Content-Type", audio_type(name))
+                    .body(bytes.clone())
+                    .map_err(|e| Fail::Final(format!("couldn't make the request: {e}")))?,
+            )
+            .map_err(|e| Fail::Retry(format!("couldn't reach Slack: {e}")))?;
+        if !put.status().is_success() {
+            let why = format!("Slack answered {} to the file", put.status());
+            return Err(if put.status().is_client_error() && put.status().as_u16() != 429 { Fail::Final(why) } else { Fail::Retry(why) });
+        }
+        let done = serde_json::json!({
+            "files": [{ "id": id, "title": n.title }],
+            "channel_id": channel,
+            "initial_comment": payload::slack_comment(n),
+        });
+        slack_post(&agent, &format!("{api}/files.completeUploadExternal"), Some(token), json, done.to_string().into_bytes()).map(drop)
+    })
+}
+
 /// `url` with `query` added, each value percent-encoded.
 fn with_query(url: &str, query: &[(String, String)]) -> String {
-    let enc = |s: &str| {
-        s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>()
-    };
-    query.iter().fold(url.to_string(), |u, (k, v)| format!("{u}{}{k}={}", if u.contains('?') { '&' } else { '?' }, enc(v)))
+    query.iter().fold(url.to_string(), |u, (k, v)| format!("{u}{}{k}={}", if u.contains('?') { '&' } else { '?' }, pct(v)))
 }
 
 /// A recording for a command: written to a file of its own (`TRP_AUDIO`), removed when it's done.
@@ -312,6 +416,89 @@ mod tests {
         assert!(text.starts_with(&format!("--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"")), "{text}");
         assert!(text.contains("name=\"files[0]\"; filename=\"20341-1792.m4a\"\r\nContent-Type: audio/mp4"), "{text}");
         assert!(text.ends_with(&format!("--{boundary}--\r\n")));
+    }
+
+    /// A stand-in for Slack: answers each request in turn (`answers` is given its address), and returns
+    /// what it was sent as (request line, body).
+    fn mock_slack(answers: impl FnOnce(&str) -> Vec<String> + Send + 'static) -> (String, std::thread::JoinHandle<Vec<(String, String)>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let me = base.clone();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for answer in answers(&me) {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (head, start, len) = loop {
+                    let n = sock.read(&mut chunk).unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..i]).to_string();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                            .unwrap_or(0);
+                        if buf.len() >= i + 4 + len {
+                            break (head, i + 4, len);
+                        }
+                    }
+                };
+                let auth = head.to_ascii_lowercase().contains("authorization: bearer xoxb-t");
+                seen.push((format!("{} auth={auth}", head.lines().next().unwrap()), String::from_utf8_lossy(&buf[start..start + len]).to_string()));
+                let _ = sock.write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}", answer.len())
+                        .as_bytes(),
+                );
+            }
+            seen
+        });
+        (base, handle)
+    }
+
+    fn slack_dest() -> Destination {
+        Destination { name: "s".into(), kind: Kind::Slack, token: "xoxb-t".into(), channel: "#C0123".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn slack_gets_the_file() {
+        let (base, seen) = mock_slack(|me| {
+            vec![format!(r#"{{"ok":true,"upload_url":"{me}/upload/F1","file_id":"F1"}}"#), "OK - 3".into(), r#"{"ok":true,"files":[{"id":"F1"}]}"#.into()]
+        });
+        let mut n = crate::payload::test_notification();
+        (n.event, n.title, n.text) = ("recording".into(), "FIRE PAGE".into(), "wood:FD_PAGE".into());
+        slack_app(&base, &slack_dest(), &n, Some(&(vec![1, 2, 3], "call.m4a".into()))).unwrap();
+        let seen = seen.join().unwrap();
+        assert_eq!(seen[0], ("POST /files.getUploadURLExternal HTTP/1.1 auth=true".into(), "filename=call.m4a&length=3".into()));
+        assert_eq!(seen[1].0, "POST /upload/F1 HTTP/1.1 auth=false");
+        assert_eq!(seen[1].1, "\u{1}\u{2}\u{3}");
+        assert!(seen[2].0.starts_with("POST /files.completeUploadExternal ") && seen[2].0.ends_with("auth=true"));
+        let done: serde_json::Value = serde_json::from_str(&seen[2].1).unwrap();
+        assert_eq!((done["channel_id"].as_str(), done["files"][0]["id"].as_str()), (Some("C0123"), Some("F1")));
+        assert!(done["initial_comment"].as_str().unwrap().contains("FIRE PAGE"));
+    }
+
+    #[test]
+    fn slack_posts_a_message_without_a_file() {
+        let (base, seen) = mock_slack(|_| vec![r#"{"ok":true}"#.into()]);
+        send_slack_message(&base);
+        let seen = seen.join().unwrap();
+        assert_eq!(seen[0].0, "POST /chat.postMessage HTTP/1.1 auth=true");
+        let m: serde_json::Value = serde_json::from_str(&seen[0].1).unwrap();
+        assert_eq!((m["channel"].as_str(), m["blocks"].is_array()), (Some("C0123"), true));
+    }
+
+    fn send_slack_message(base: &str) {
+        slack_app(base, &slack_dest(), &crate::payload::test_notification(), None).unwrap();
+    }
+
+    #[test]
+    fn slack_says_why_it_refused() {
+        let (base, _seen) = mock_slack(|_| vec![r#"{"ok":false,"error":"not_in_channel"}"#.into()]);
+        let e = slack_app(&base, &slack_dest(), &crate::payload::test_notification(), None).unwrap_err();
+        assert_eq!(e, "Slack said not_in_channel");
+        let none = Destination { token: String::new(), ..slack_dest() };
+        assert!(slack_app("http://unused", &none, &crate::payload::test_notification(), None).unwrap_err().contains("token"));
     }
 
     #[test]

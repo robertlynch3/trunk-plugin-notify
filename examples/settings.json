@@ -11,7 +11,8 @@
     { "name": "Emergencies", "event": "emergency", "systems": ["clmrn-I"], "to": ["Station pager"] }
   ],
   "destinations": [
-    { "name": "Station pager", "type": "webhook", "format": "discord", "url": "https://discord.com/api/webhooks/…" }
+    { "name": "Station pager", "type": "webhook", "format": "discord", "url": "https://discord.com/api/webhooks/…" },
+    { "name": "Slack audio", "type": "slack", "token": "xoxb-…", "channel": "C0123456789" }
   ],
   "recorderAddress": "http://100.64.0.5:8091"
 }

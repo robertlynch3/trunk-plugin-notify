@@ -16,12 +16,12 @@ pub struct Settings {
     pub rules: Vec<Rule>,
     /// Destinations
     ///
-    /// Where rules send word: a webhook, or a command on this computer.
+    /// Where rules send word: a webhook, a Slack app, or a command on this computer.
     pub destinations: Vec<Destination>,
     /// Link recordings from
     ///
     /// A recording goes as a file to Discord and ntfy, inside the JSON of JSON webhooks, and to commands
-    /// (TRP_AUDIO). Slack's webhooks can't take a file, so they need a link: this recorder's address as
+    /// (TRP_AUDIO), and as a file to a Slack app. Slack's webhooks can't take a file, so they need a link: this recorder's address as
     /// the people reading the message reach it (http://100.64.0.5:8091). Every recording then has a link
     /// too. Empty: no links. A link plays the call while Setup's Recording settings keep its audio.
     #[schemars(extend("format" = "uri"))]
@@ -281,7 +281,7 @@ pub enum Encryption {
     "x-summary" = ["{type}", "{format}", "{command}"],
     "x-actions" = [
         { "id": "test", "label": "Send a test", "hint": "Sends a test notification now, as it's set up here" },
-        { "id": "test_recording", "label": "Send a test recording", "hint": "As a call's recording follows: a few seconds of a page (Discord: as a file)" }
+        { "id": "test_recording", "label": "Send a test recording", "hint": "As a call's recording follows: a few seconds of a page (as a file where the destination takes one)" }
     ]
 ))]
 pub struct Destination {
@@ -324,6 +324,19 @@ pub struct Destination {
     #[schemars(extend("x-multiline" = true))]
     #[schemars(extend("x-when" = { "type": "webhook" }))]
     pub body: String,
+    /// Bot token
+    ///
+    /// A Slack app's bot token (xoxb-…), with the chat:write scope, and files:write to send recordings
+    /// as files. Slack's incoming webhooks can't take a file; a bot can.
+    #[schemars(extend("x-secret" = true))]
+    #[schemars(extend("x-when" = { "type": "slack" }))]
+    pub token: String,
+    /// Channel
+    ///
+    /// The channel's ID (C0123456789: in Slack, its details, at the bottom). The app has to be in
+    /// the channel (/invite @app). A name works for messages, not for files.
+    #[schemars(extend("x-when" = { "type": "slack" }))]
+    pub channel: String,
     /// Command
     ///
     /// Run by the shell as the recorder's user, given the notification's JSON on stdin and
@@ -351,6 +364,8 @@ pub enum Kind {
     /// Webhook
     #[default]
     Webhook,
+    /// Slack app
+    Slack,
     /// Command
     Command,
 }
